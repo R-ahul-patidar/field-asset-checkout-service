@@ -4,6 +4,7 @@ from django.db import connection, transaction, OperationalError, IntegrityError
 from django.db.models import Prefetch
 from django.utils import timezone
 from rest_framework import viewsets, filters, status, mixins
+from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -13,6 +14,7 @@ from .models import Asset, Employee, CheckOut, OverdueNotice
 from .serializers import (
     AssetSerializer,
     CheckOutCreateSerializer,
+    CheckOutReturnSerializer,
     CheckOutSerializer,
 )
 
@@ -77,7 +79,7 @@ class CheckOutViewSet(
     viewsets.GenericViewSet
 ):
     """
-    API endpoint for asset check-out operations.
+    API endpoint for asset check-out and return operations.
     Enforces business rules with strict database-level concurrency and atomic locking.
     """
     queryset = CheckOut.objects.all().select_related('asset', 'employee')
@@ -163,5 +165,63 @@ class CheckOutViewSet(
             logger.warning("Concurrency conflict during checkout: %s", exc)
             return Response(
                 {"detail": "Conflict occurred during checkout. Please retry."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+    @action(detail=True, methods=['post'], url_path='return')
+    def return_asset(self, request, pk=None):
+        """
+        Rule 6: Return a checked-out asset.
+        Sets returned_at to now, updates asset status to AVAILABLE (or MAINTENANCE),
+        and prevents already-returned checkouts (409 Conflict).
+        """
+        serializer = CheckOutReturnSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        condition_note = serializer.validated_data.get('condition_note', '')
+        needs_maintenance = serializer.validated_data.get('needs_maintenance', False)
+
+        try:
+            with transaction.atomic():
+                try:
+                    checkout = (
+                        CheckOut.objects
+                        .select_for_update()
+                        .select_related('asset')
+                        .get(pk=pk)
+                    )
+                except CheckOut.DoesNotExist:
+                    return Response(
+                        {"detail": f"CheckOut #{pk} not found."},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+
+                # Rule 6: Returning an already-returned check-out -> 409 Conflict
+                if checkout.returned_at is not None:
+                    return Response(
+                        {"detail": f"CheckOut #{pk} has already been returned."},
+                        status=status.HTTP_409_CONFLICT
+                    )
+
+                # Lock the asset row
+                asset = Asset.objects.select_for_update().get(pk=checkout.asset_id)
+
+                checkout.returned_at = timezone.now()
+                if condition_note:
+                    checkout.condition_note = condition_note
+                checkout.save(update_fields=['returned_at', 'condition_note'])
+
+                if needs_maintenance:
+                    asset.status = Asset.Status.MAINTENANCE
+                else:
+                    asset.status = Asset.Status.AVAILABLE
+                asset.save(update_fields=['status', 'updated_at'])
+
+                response_serializer = CheckOutSerializer(checkout)
+                return Response(response_serializer.data, status=status.HTTP_200_OK)
+        except (OperationalError, IntegrityError) as exc:
+            logger.warning("Concurrency conflict during return: %s", exc)
+            return Response(
+                {"detail": "Conflict occurred during return operation. Please retry."},
                 status=status.HTTP_409_CONFLICT
             )

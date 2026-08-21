@@ -59,6 +59,11 @@ class CheckOutCreateSerializer(serializers.Serializer):
     due_at = serializers.DateTimeField()
 
 
+class CheckOutReturnSerializer(serializers.Serializer):
+    condition_note = serializers.CharField(required=False, allow_blank=True, default='')
+    needs_maintenance = serializers.BooleanField(required=False, default=False)
+
+
 class CheckOutSerializer(serializers.ModelSerializer):
     asset_tag = serializers.CharField(source='asset.asset_tag', read_only=True)
     asset_name = serializers.CharField(source='asset.name', read_only=True)
