@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework.authtoken',
     'django_filters',
+    'drf_spectacular',
     # Local apps
     'assets.apps.AssetsConfig',
 ]
@@ -135,6 +136,20 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
         'rest_framework.filters.OrderingFilter',
     ],
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+# Spectacular / Swagger UI Documentation Settings
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Field Asset Check-Out Service API',
+    'DESCRIPTION': 'Production-grade REST API for tracking physical field equipment check-outs, returns, employee summaries, and overdue audits.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SWAGGER_UI_SETTINGS': {
+        'deepLinking': True,
+        'persistAuthorization': True,
+        'displayOperationId': True,
+    },
 }
 
 # Celery Configuration
