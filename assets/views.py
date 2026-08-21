@@ -1,9 +1,17 @@
 import logging
 from datetime import timedelta
 from django.db import connection, transaction, OperationalError, IntegrityError
-from django.db.models import Prefetch
+from django.db.models import (
+    Count,
+    Avg,
+    F,
+    Q,
+    ExpressionWrapper,
+    DurationField,
+    Prefetch,
+)
 from django.utils import timezone
-from rest_framework import viewsets, filters, status, mixins
+from rest_framework import viewsets, generics, filters, status, mixins
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -16,6 +24,8 @@ from .serializers import (
     CheckOutCreateSerializer,
     CheckOutReturnSerializer,
     CheckOutSerializer,
+    EmployeeSummarySerializer,
+    OverdueReportItemSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -225,3 +235,101 @@ class CheckOutViewSet(
                 {"detail": "Conflict occurred during return operation. Please retry."},
                 status=status.HTTP_409_CONFLICT
             )
+
+
+class EmployeeSummaryView(APIView):
+    """
+    Returns four key statistics for an employee in a single ORM aggregation query:
+    1. lifetime_checkouts
+    2. currently_held
+    3. currently_overdue
+    4. mean_hold_duration_days
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, employee_code=None):
+        now = timezone.now()
+
+        summary = (
+            Employee.objects
+            .filter(employee_code=employee_code)
+            .annotate(
+                lifetime_checkouts=Count('checkouts', distinct=True),
+                currently_held=Count(
+                    'checkouts',
+                    filter=Q(checkouts__returned_at__isnull=True),
+                    distinct=True
+                ),
+                currently_overdue=Count(
+                    'checkouts',
+                    filter=Q(
+                        checkouts__returned_at__isnull=True,
+                        checkouts__due_at__lt=now
+                    ),
+                    distinct=True
+                ),
+                mean_duration=Avg(
+                    ExpressionWrapper(
+                        F('checkouts__returned_at') - F('checkouts__checked_out_at'),
+                        output_field=DurationField()
+                    ),
+                    filter=Q(checkouts__returned_at__isnull=False)
+                )
+            )
+            .values(
+                'lifetime_checkouts',
+                'currently_held',
+                'currently_overdue',
+                'mean_duration'
+            )
+            .first()
+        )
+
+        if summary is None:
+            return Response(
+                {"detail": f"Employee with code '{employee_code}' not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        mean_duration = summary['mean_duration']
+        mean_days = None
+        if mean_duration is not None:
+            if isinstance(mean_duration, timedelta):
+                mean_days = round(mean_duration.total_seconds() / 86400.0, 2)
+            elif isinstance(mean_duration, (int, float)):
+                # Handle SQLite duration format in microseconds or seconds
+                val = float(mean_duration)
+                if val > 1_000_000_000:
+                    mean_days = round(val / (86400.0 * 1_000_000.0), 2)
+                else:
+                    mean_days = round(val / 86400.0, 2)
+
+        return Response(
+            {
+                "lifetime_checkouts": summary["lifetime_checkouts"],
+                "currently_held": summary["currently_held"],
+                "currently_overdue": summary["currently_overdue"],
+                "mean_hold_duration_days": mean_days,
+            },
+            status=status.HTTP_200_OK
+        )
+
+
+class OverdueReportView(generics.ListAPIView):
+    """
+    Returns all open check-outs past due date, ordered most overdue first.
+    Query-optimized with select_related to prevent N+1 queries.
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = OverdueReportItemSerializer
+
+    def get_queryset(self):
+        return (
+            CheckOut.objects
+            .filter(
+                returned_at__isnull=True,
+                due_at__lt=timezone.now()
+            )
+            .select_related('asset', 'employee')
+            .order_by('due_at')
+        )

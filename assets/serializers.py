@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.utils import timezone
 from .models import Asset, Employee, CheckOut, OverdueNotice
 
 
@@ -92,3 +93,36 @@ class CheckOutSerializer(serializers.ModelSerializer):
             'checked_out_at',
             'returned_at',
         ]
+
+
+class EmployeeSummarySerializer(serializers.Serializer):
+    lifetime_checkouts = serializers.IntegerField()
+    currently_held = serializers.IntegerField()
+    currently_overdue = serializers.IntegerField()
+    mean_hold_duration_days = serializers.FloatField(allow_null=True)
+
+
+class OverdueReportItemSerializer(serializers.ModelSerializer):
+    asset_name = serializers.CharField(source='asset.name', read_only=True)
+    asset_tag = serializers.CharField(source='asset.asset_tag', read_only=True)
+    employee_code = serializers.CharField(source='employee.employee_code', read_only=True)
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
+    days_overdue = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CheckOut
+        fields = [
+            'id',
+            'asset_name',
+            'asset_tag',
+            'employee_code',
+            'employee_name',
+            'due_at',
+            'days_overdue',
+        ]
+
+    def get_days_overdue(self, obj):
+        now = timezone.now()
+        if obj.due_at < now:
+            return (now - obj.due_at).days
+        return 0
