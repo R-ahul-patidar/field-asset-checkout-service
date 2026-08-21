@@ -1,14 +1,20 @@
 import logging
-from django.db import connection
+from datetime import timedelta
+from django.db import connection, transaction, OperationalError, IntegrityError
 from django.db.models import Prefetch
-from rest_framework import viewsets, filters, status
+from django.utils import timezone
+from rest_framework import viewsets, filters, status, mixins
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import Asset, Employee, CheckOut, OverdueNotice
-from .serializers import AssetSerializer
+from .serializers import (
+    AssetSerializer,
+    CheckOutCreateSerializer,
+    CheckOutSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,3 +68,100 @@ class AssetViewSet(viewsets.ModelViewSet):
                 to_attr='active_checkouts'
             )
         )
+
+
+class CheckOutViewSet(
+    mixins.CreateModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.ListModelMixin,
+    viewsets.GenericViewSet
+):
+    """
+    API endpoint for asset check-out operations.
+    Enforces business rules with strict database-level concurrency and atomic locking.
+    """
+    queryset = CheckOut.objects.all().select_related('asset', 'employee')
+    serializer_class = CheckOutSerializer
+    permission_classes = [IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = CheckOutCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        asset_tag = serializer.validated_data['asset_tag']
+        employee_code = serializer.validated_data['employee_code']
+        due_at = serializer.validated_data['due_at']
+
+        # Rule 4: due_at must be in the future and <= 30 days from now
+        now = timezone.now()
+        if due_at <= now:
+            return Response(
+                {"detail": "due_at must be in the future."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if due_at > now + timedelta(days=30):
+            return Response(
+                {"detail": "due_at cannot be more than 30 days in the future."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            with transaction.atomic():
+                # Consistent Lock Ordering: 1. Employee, 2. Asset (prevents deadlocks)
+                # Rule 8: Unknown employee_code -> 404
+                try:
+                    employee = Employee.objects.select_for_update().get(employee_code=employee_code)
+                except Employee.DoesNotExist:
+                    return Response(
+                        {"detail": f"Employee with code '{employee_code}' not found."},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+
+                # Rule 2: Inactive employee cannot check out anything -> 400
+                if not employee.is_active:
+                    return Response(
+                        {"detail": "Inactive employee cannot check out assets."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Rule 3: Max 3 open checkouts -> 409
+                open_count = CheckOut.objects.filter(employee=employee, returned_at__isnull=True).count()
+                if open_count >= 3:
+                    return Response(
+                        {"detail": "Employee has reached the maximum limit of 3 open check-outs."},
+                        status=status.HTTP_409_CONFLICT
+                    )
+
+                # Rule 8: Unknown asset_tag -> 404
+                try:
+                    asset = Asset.objects.select_for_update().get(asset_tag=asset_tag)
+                except Asset.DoesNotExist:
+                    return Response(
+                        {"detail": f"Asset with tag '{asset_tag}' not found."},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+
+                # Rule 1: Asset status must be AVAILABLE -> 409
+                if asset.status != Asset.Status.AVAILABLE:
+                    return Response(
+                        {"detail": f"Asset '{asset_tag}' is not available (current status: {asset.status})."},
+                        status=status.HTTP_409_CONFLICT
+                    )
+
+                # Rule 5: Create checkout and set asset status to CHECKED_OUT atomically
+                checkout = CheckOut.objects.create(
+                    asset=asset,
+                    employee=employee,
+                    due_at=due_at
+                )
+                asset.status = Asset.Status.CHECKED_OUT
+                asset.save(update_fields=['status', 'updated_at'])
+
+                response_serializer = CheckOutSerializer(checkout)
+                return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+        except (OperationalError, IntegrityError) as exc:
+            logger.warning("Concurrency conflict during checkout: %s", exc)
+            return Response(
+                {"detail": "Conflict occurred during checkout. Please retry."},
+                status=status.HTTP_409_CONFLICT
+            )
