@@ -1,3 +1,4 @@
+import time
 import logging
 from datetime import timedelta
 from django.db import connection, transaction, OperationalError, IntegrityError
@@ -117,66 +118,77 @@ class CheckOutViewSet(
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            with transaction.atomic():
-                # Consistent Lock Ordering: 1. Employee, 2. Asset (prevents deadlocks)
-                # Rule 8: Unknown employee_code -> 404
-                try:
-                    employee = Employee.objects.select_for_update().get(employee_code=employee_code)
-                except Employee.DoesNotExist:
-                    return Response(
-                        {"detail": f"Employee with code '{employee_code}' not found."},
-                        status=status.HTTP_404_NOT_FOUND
-                    )
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with transaction.atomic():
+                    # Consistent Lock Ordering: 1. Employee, 2. Asset (prevents deadlocks)
+                    # Rule 8: Unknown employee_code -> 404
+                    try:
+                        employee = Employee.objects.select_for_update().get(employee_code=employee_code)
+                    except Employee.DoesNotExist:
+                        return Response(
+                            {"detail": f"Employee with code '{employee_code}' not found."},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
 
-                # Rule 2: Inactive employee cannot check out anything -> 400
-                if not employee.is_active:
-                    return Response(
-                        {"detail": "Inactive employee cannot check out assets."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                    # Rule 2: Inactive employee cannot check out anything -> 400
+                    if not employee.is_active:
+                        return Response(
+                            {"detail": "Inactive employee cannot check out assets."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
 
-                # Rule 3: Max 3 open checkouts -> 409
-                open_count = CheckOut.objects.filter(employee=employee, returned_at__isnull=True).count()
-                if open_count >= 3:
-                    return Response(
-                        {"detail": "Employee has reached the maximum limit of 3 open check-outs."},
-                        status=status.HTTP_409_CONFLICT
-                    )
+                    # Rule 3: Max 3 open checkouts -> 409
+                    open_count = CheckOut.objects.filter(employee=employee, returned_at__isnull=True).count()
+                    if open_count >= 3:
+                        return Response(
+                            {"detail": "Employee has reached the maximum limit of 3 open check-outs."},
+                            status=status.HTTP_409_CONFLICT
+                        )
 
-                # Rule 8: Unknown asset_tag -> 404
-                try:
-                    asset = Asset.objects.select_for_update().get(asset_tag=asset_tag)
-                except Asset.DoesNotExist:
-                    return Response(
-                        {"detail": f"Asset with tag '{asset_tag}' not found."},
-                        status=status.HTTP_404_NOT_FOUND
-                    )
+                    # Rule 8: Unknown asset_tag -> 404
+                    try:
+                        asset = Asset.objects.select_for_update().get(asset_tag=asset_tag)
+                    except Asset.DoesNotExist:
+                        return Response(
+                            {"detail": f"Asset with tag '{asset_tag}' not found."},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
 
-                # Rule 1: Asset status must be AVAILABLE -> 409
-                if asset.status != Asset.Status.AVAILABLE:
-                    return Response(
-                        {"detail": f"Asset '{asset_tag}' is not available (current status: {asset.status})."},
-                        status=status.HTTP_409_CONFLICT
-                    )
+                    # Rule 1: Asset status must be AVAILABLE -> 409
+                    if asset.status != Asset.Status.AVAILABLE:
+                        return Response(
+                            {"detail": f"Asset '{asset_tag}' is not available (current status: {asset.status})."},
+                            status=status.HTTP_409_CONFLICT
+                        )
 
-                # Rule 5: Create checkout and set asset status to CHECKED_OUT atomically
-                checkout = CheckOut.objects.create(
-                    asset=asset,
-                    employee=employee,
-                    due_at=due_at
+                    # Rule 5: Create checkout and set asset status to CHECKED_OUT atomically
+                    checkout = CheckOut.objects.create(
+                        asset=asset,
+                        employee=employee,
+                        due_at=due_at
+                    )
+                    asset.status = Asset.Status.CHECKED_OUT
+                    asset.save(update_fields=['status', 'updated_at'])
+
+                    response_serializer = CheckOutSerializer(checkout)
+                    return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+            except OperationalError as exc:
+                if attempt < max_retries - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.warning("Concurrency conflict during checkout: %s", exc)
+                return Response(
+                    {"detail": "Conflict occurred during checkout. Please retry."},
+                    status=status.HTTP_409_CONFLICT
                 )
-                asset.status = Asset.Status.CHECKED_OUT
-                asset.save(update_fields=['status', 'updated_at'])
-
-                response_serializer = CheckOutSerializer(checkout)
-                return Response(response_serializer.data, status=status.HTTP_201_CREATED)
-        except (OperationalError, IntegrityError) as exc:
-            logger.warning("Concurrency conflict during checkout: %s", exc)
-            return Response(
-                {"detail": "Conflict occurred during checkout. Please retry."},
-                status=status.HTTP_409_CONFLICT
-            )
+            except IntegrityError as exc:
+                logger.warning("Integrity conflict during checkout: %s", exc)
+                return Response(
+                    {"detail": "Conflict occurred during checkout. Please retry."},
+                    status=status.HTTP_409_CONFLICT
+                )
 
     @action(detail=True, methods=['post'], url_path='return')
     def return_asset(self, request, pk=None):
@@ -191,50 +203,61 @@ class CheckOutViewSet(
         condition_note = serializer.validated_data.get('condition_note', '')
         needs_maintenance = serializer.validated_data.get('needs_maintenance', False)
 
-        try:
-            with transaction.atomic():
-                try:
-                    checkout = (
-                        CheckOut.objects
-                        .select_for_update()
-                        .select_related('asset')
-                        .get(pk=pk)
-                    )
-                except CheckOut.DoesNotExist:
-                    return Response(
-                        {"detail": f"CheckOut #{pk} not found."},
-                        status=status.HTTP_404_NOT_FOUND
-                    )
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with transaction.atomic():
+                    try:
+                        checkout = (
+                            CheckOut.objects
+                            .select_for_update()
+                            .select_related('asset')
+                            .get(pk=pk)
+                        )
+                    except CheckOut.DoesNotExist:
+                        return Response(
+                            {"detail": f"CheckOut #{pk} not found."},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
 
-                # Rule 6: Returning an already-returned check-out -> 409 Conflict
-                if checkout.returned_at is not None:
-                    return Response(
-                        {"detail": f"CheckOut #{pk} has already been returned."},
-                        status=status.HTTP_409_CONFLICT
-                    )
+                    # Rule 6: Returning an already-returned check-out -> 409 Conflict
+                    if checkout.returned_at is not None:
+                        return Response(
+                            {"detail": f"CheckOut #{pk} has already been returned."},
+                            status=status.HTTP_409_CONFLICT
+                        )
 
-                # Lock the asset row
-                asset = Asset.objects.select_for_update().get(pk=checkout.asset_id)
+                    # Lock the asset row
+                    asset = Asset.objects.select_for_update().get(pk=checkout.asset_id)
 
-                checkout.returned_at = timezone.now()
-                if condition_note:
-                    checkout.condition_note = condition_note
-                checkout.save(update_fields=['returned_at', 'condition_note'])
+                    checkout.returned_at = timezone.now()
+                    if condition_note:
+                        checkout.condition_note = condition_note
+                    checkout.save(update_fields=['returned_at', 'condition_note'])
 
-                if needs_maintenance:
-                    asset.status = Asset.Status.MAINTENANCE
-                else:
-                    asset.status = Asset.Status.AVAILABLE
-                asset.save(update_fields=['status', 'updated_at'])
+                    if needs_maintenance:
+                        asset.status = Asset.Status.MAINTENANCE
+                    else:
+                        asset.status = Asset.Status.AVAILABLE
+                    asset.save(update_fields=['status', 'updated_at'])
 
-                response_serializer = CheckOutSerializer(checkout)
-                return Response(response_serializer.data, status=status.HTTP_200_OK)
-        except (OperationalError, IntegrityError) as exc:
-            logger.warning("Concurrency conflict during return: %s", exc)
-            return Response(
-                {"detail": "Conflict occurred during return operation. Please retry."},
-                status=status.HTTP_409_CONFLICT
-            )
+                    response_serializer = CheckOutSerializer(checkout)
+                    return Response(response_serializer.data, status=status.HTTP_200_OK)
+            except OperationalError as exc:
+                if attempt < max_retries - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.warning("Concurrency conflict during return: %s", exc)
+                return Response(
+                    {"detail": "Conflict occurred during return operation. Please retry."},
+                    status=status.HTTP_409_CONFLICT
+                )
+            except IntegrityError as exc:
+                logger.warning("Integrity conflict during return: %s", exc)
+                return Response(
+                    {"detail": "Conflict occurred during return operation. Please retry."},
+                    status=status.HTTP_409_CONFLICT
+                )
 
 
 class EmployeeSummaryView(APIView):
@@ -297,7 +320,6 @@ class EmployeeSummaryView(APIView):
             if isinstance(mean_duration, timedelta):
                 mean_days = round(mean_duration.total_seconds() / 86400.0, 2)
             elif isinstance(mean_duration, (int, float)):
-                # Handle SQLite duration format in microseconds or seconds
                 val = float(mean_duration)
                 if val > 1_000_000_000:
                     mean_days = round(val / (86400.0 * 1_000_000.0), 2)
